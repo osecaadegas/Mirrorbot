@@ -1,0 +1,22 @@
+{
+  "name": "discord-mirror-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot that mirrors messages between two channels across different servers",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "mirror"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.3"
+  }
+}
