@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "A Discord bot that mirrors messages between two channels across different servers",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"

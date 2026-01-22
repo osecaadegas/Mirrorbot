@@ -1,6 +1,16 @@
 const { Client, GatewayIntentBits, EmbedBuilder, WebhookClient } = require('discord.js');
+const http = require('http');
 require('dotenv').config();
 const config = require('./config.json');
+
+// Simple HTTP server to keep Render happy (free tier requires a web service)
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Discord Mirror Bot is running!');
+}).listen(PORT, () => {
+    console.log(`🌐 HTTP server running on port ${PORT}`);
+});
 
 // Create the Discord client with necessary intents
 const client = new Client({
