@@ -1,7 +1,17 @@
-const { Client, GatewayIntentBits, EmbedBuilder, WebhookClient } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, WebhookClient, SlashCommandBuilder, PermissionFlagsBits, REST, Routes } = require('discord.js');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
-const config = require('./config.json');
+
+// Load config from file (mutable)
+const configPath = path.join(__dirname, 'config.json');
+let config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+// Save config to file
+function saveConfig() {
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 4));
+}
 
 // Simple HTTP server to keep Render happy (free tier requires a web service)
 const PORT = process.env.PORT || 3000;
@@ -21,96 +31,278 @@ const client = new Client({
     ]
 });
 
-// Store webhooks for each channel pair
+// Store webhooks for each channel (maps channelId -> array of webhook clients for other channels)
 const webhooks = new Map();
 
-// Initialize webhooks for mirroring
+// Define slash commands - simplified for single global sync
+const commands = [
+    new SlashCommandBuilder()
+        .setName('mirror')
+        .setDescription('Configure channel mirroring for double account detection')
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('link')
+                .setDescription('Link this channel to the global sync network')
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('unlink')
+                .setDescription('Remove this channel from the sync network')
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('list')
+                .setDescription('List all linked channels across all servers')
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('status')
+                .setDescription('Check if this channel is linked')
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+];
+
+// Register slash commands
+async function registerCommands() {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    try {
+        console.log('🔄 Registering slash commands...');
+        await rest.put(
+            Routes.applicationCommands(client.user.id),
+            { body: commands.map(cmd => cmd.toJSON()) }
+        );
+        console.log('✅ Slash commands registered!');
+    } catch (error) {
+        console.error('❌ Error registering commands:', error);
+    }
+}
+
+// Initialize webhooks for all linked channels
 async function initializeWebhooks() {
-    for (const pair of config.channelPairs) {
+    webhooks.clear();
+    
+    const linkedChannels = config.linkedChannels || [];
+    if (linkedChannels.length < 2) {
+        console.log('⚠️ Need at least 2 channels linked to start mirroring');
+        return;
+    }
+    
+    const channelWebhooks = new Map();
+    
+    // Get or create webhook for each channel
+    for (const channelId of linkedChannels) {
         try {
-            // Get or create webhook for channel A
-            const channelA = await client.channels.fetch(pair.channelA);
-            const channelB = await client.channels.fetch(pair.channelB);
-
-            if (channelA && channelB) {
-                // Get existing webhooks or create new ones
-                const webhooksA = await channelA.fetchWebhooks();
-                const webhooksB = await channelB.fetchWebhooks();
-
-                let webhookA = webhooksA.find(wh => wh.name === 'Mirror Bot');
-                let webhookB = webhooksB.find(wh => wh.name === 'Mirror Bot');
-
-                if (!webhookA) {
-                    webhookA = await channelA.createWebhook({
-                        name: 'Mirror Bot',
-                        reason: 'Mirror bot webhook for message forwarding'
-                    });
-                }
-
-                if (!webhookB) {
-                    webhookB = await channelB.createWebhook({
-                        name: 'Mirror Bot',
-                        reason: 'Mirror bot webhook for message forwarding'
-                    });
-                }
-
-                // Store webhook clients
-                webhooks.set(pair.channelA, new WebhookClient({ url: webhookB.url }));
-                webhooks.set(pair.channelB, new WebhookClient({ url: webhookA.url }));
-
-                console.log(`✅ Initialized webhook pair: ${channelA.name} <-> ${channelB.name}`);
+            const channel = await client.channels.fetch(channelId);
+            if (!channel) continue;
+            
+            const existingWebhooks = await channel.fetchWebhooks();
+            let webhook = existingWebhooks.find(wh => wh.name === 'Mirror Bot');
+            
+            if (!webhook) {
+                webhook = await channel.createWebhook({
+                    name: 'Mirror Bot',
+                    reason: 'Mirror bot for double account detection'
+                });
             }
-        } catch (error) {
-            console.error(`❌ Error initializing webhooks for pair:`, error);
+            channelWebhooks.set(channelId, webhook);
+            console.log(`   ✅ Webhook ready for #${channel.name} (${channel.guild.name})`);
+        } catch (e) {
+            console.error(`   ❌ Could not setup webhook for ${channelId}:`, e.message);
         }
     }
+    
+    // For each channel, create webhook clients for ALL OTHER channels
+    for (const channelId of linkedChannels) {
+        const targetWebhooks = [];
+        for (const [otherId, webhook] of channelWebhooks) {
+            if (otherId !== channelId) {
+                targetWebhooks.push(new WebhookClient({ url: webhook.url }));
+            }
+        }
+        if (targetWebhooks.length > 0) {
+            webhooks.set(channelId, targetWebhooks);
+        }
+    }
+    
+    console.log(`✅ Mirroring active across ${channelWebhooks.size} channels`);
 }
 
 // When the bot is ready
 client.once('ready', async () => {
     console.log(`🤖 Logged in as ${client.user.tag}`);
-    console.log(`📡 Monitoring ${config.channelPairs.length} channel pair(s)`);
-    console.log(`📋 Channel IDs being watched: ${config.channelPairs.map(p => `${p.channelA}, ${p.channelB}`).join('; ')}`);
+    console.log(`🎰 Double Account Detection Bot`);
     
-    // Check bot permissions in each channel
-    for (const pair of config.channelPairs) {
-        try {
-            const chA = await client.channels.fetch(pair.channelA);
-            const chB = await client.channels.fetch(pair.channelB);
-            console.log(`🔍 Channel A (${chA.name}): Can view = ${chA.permissionsFor(client.user).has('ViewChannel')}, Can read history = ${chA.permissionsFor(client.user).has('ReadMessageHistory')}`);
-            console.log(`🔍 Channel B (${chB.name}): Can view = ${chB.permissionsFor(client.user).has('ViewChannel')}, Can read history = ${chB.permissionsFor(client.user).has('ReadMessageHistory')}`);
-        } catch (e) {
-            console.log(`❌ Error checking permissions: ${e.message}`);
+    // Register slash commands
+    await registerCommands();
+    
+    // Initialize linkedChannels if not exists
+    if (!config.linkedChannels) {
+        config.linkedChannels = [];
+        saveConfig();
+    }
+    
+    const linkedCount = config.linkedChannels.length;
+    console.log(`📡 ${linkedCount} channel(s) in sync network`);
+    
+    // Log linked channels
+    if (linkedCount > 0) {
+        console.log('📋 Linked channels:');
+        for (const channelId of config.linkedChannels) {
+            try {
+                const ch = await client.channels.fetch(channelId);
+                console.log(`   - #${ch.name} (${ch.guild.name})`);
+            } catch (e) {
+                console.log(`   - ${channelId} (could not fetch - removing)`);
+                // Remove invalid channels
+                config.linkedChannels = config.linkedChannels.filter(id => id !== channelId);
+                saveConfig();
+            }
         }
     }
     
     await initializeWebhooks();
-    console.log('✅ Bot is ready to mirror messages!');
+    console.log('✅ Bot is ready!');
+    console.log('💡 Use /mirror link in each server channel to add it to the network');
 });
 
-// Debug: log all raw events
-client.on('raw', (event) => {
-    if (event.t === 'MESSAGE_CREATE') {
-        console.log(`🔔 RAW MESSAGE_CREATE event in channel: ${event.d.channel_id}`);
+// Handle slash commands
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    
+    if (interaction.commandName === 'mirror') {
+        const subcommand = interaction.options.getSubcommand();
+        
+        if (subcommand === 'link') {
+            const channelId = interaction.channelId;
+            const channel = interaction.channel;
+            
+            // Initialize if needed
+            if (!config.linkedChannels) {
+                config.linkedChannels = [];
+            }
+            
+            // Check if already linked
+            if (config.linkedChannels.includes(channelId)) {
+                return interaction.reply({
+                    content: '⚠️ This channel is already linked to the sync network!',
+                    ephemeral: true
+                });
+            }
+            
+            // Add channel
+            config.linkedChannels.push(channelId);
+            saveConfig();
+            await initializeWebhooks();
+            
+            const totalChannels = config.linkedChannels.length;
+            const embed = new EmbedBuilder()
+                .setTitle('🔗 Channel Linked!')
+                .setColor(0x00ff00)
+                .setDescription(`**#${channel.name}** is now part of the sync network`)
+                .addFields(
+                    { name: 'Server', value: interaction.guild.name, inline: true },
+                    { name: 'Total Channels', value: totalChannels.toString(), inline: true }
+                )
+                .setFooter({ text: totalChannels >= 2 ? '✅ Messages will now sync across all linked channels!' : '⚠️ Link at least one more channel to start syncing' });
+            
+            return interaction.reply({ embeds: [embed] });
+        }
+        
+        if (subcommand === 'unlink') {
+            const channelId = interaction.channelId;
+            
+            if (!config.linkedChannels || !config.linkedChannels.includes(channelId)) {
+                return interaction.reply({
+                    content: '⚠️ This channel is not linked to the sync network.',
+                    ephemeral: true
+                });
+            }
+            
+            // Remove channel
+            config.linkedChannels = config.linkedChannels.filter(id => id !== channelId);
+            saveConfig();
+            await initializeWebhooks();
+            
+            const embed = new EmbedBuilder()
+                .setTitle('🔓 Channel Unlinked!')
+                .setColor(0xff6600)
+                .setDescription('This channel has been removed from the sync network');
+            
+            return interaction.reply({ embeds: [embed] });
+        }
+        
+        if (subcommand === 'list') {
+            const linkedChannels = config.linkedChannels || [];
+            
+            if (linkedChannels.length === 0) {
+                return interaction.reply({
+                    content: '📭 No channels linked yet. Use `/mirror link` in each server to add channels!',
+                    ephemeral: true
+                });
+            }
+            
+            const channelList = [];
+            for (const chId of linkedChannels) {
+                try {
+                    const ch = await client.channels.fetch(chId);
+                    const isCurrent = chId === interaction.channelId ? ' 👈 (this channel)' : '';
+                    channelList.push(`• #${ch.name} - **${ch.guild.name}**${isCurrent}`);
+                } catch (e) {
+                    channelList.push(`• Unknown channel (${chId})`);
+                }
+            }
+            
+            const embed = new EmbedBuilder()
+                .setTitle('🌐 Sync Network')
+                .setColor(0x0099ff)
+                .setDescription(`**${linkedChannels.length} channel(s)** linked for double account detection`)
+                .addFields({
+                    name: 'Linked Channels',
+                    value: channelList.join('\n'),
+                    inline: false
+                })
+                .setFooter({ text: 'Messages sent in any channel will appear in all others' });
+            
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+        
+        if (subcommand === 'status') {
+            const channelId = interaction.channelId;
+            const isLinked = config.linkedChannels && config.linkedChannels.includes(channelId);
+            
+            if (!isLinked) {
+                const embed = new EmbedBuilder()
+                    .setTitle('📊 Channel Status')
+                    .setColor(0x888888)
+                    .setDescription('This channel is **not linked** to the sync network.')
+                    .setFooter({ text: 'Use /mirror link to add it' });
+                return interaction.reply({ embeds: [embed], ephemeral: true });
+            }
+            
+            const totalChannels = config.linkedChannels.length;
+            const embed = new EmbedBuilder()
+                .setTitle('📊 Channel Status')
+                .setColor(0x00ff00)
+                .setDescription('This channel is **linked** to the sync network!')
+                .addFields(
+                    { name: 'Status', value: totalChannels >= 2 ? '✅ Active' : '⚠️ Waiting for more channels', inline: true },
+                    { name: 'Network Size', value: `${totalChannels} channel(s)`, inline: true }
+                )
+                .setFooter({ text: 'Messages here will sync to all other linked channels' });
+            
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
     }
 });
 
 // Listen for messages
 client.on('messageCreate', async (message) => {
-    console.log(`📩 Message received in channel: ${message.channel.id} from ${message.author.tag}`);
-    
     // Ignore bot messages and system messages
-    if (message.author.bot || message.system) {
-        console.log('   ↳ Ignored (bot or system message)');
-        return;
-    }
+    if (message.author.bot || message.system) return;
 
     // Check if this channel is being mirrored
-    const webhook = webhooks.get(message.channel.id);
-    if (!webhook) {
-        console.log(`   ↳ Channel ${message.channel.id} is not in mirror list`);
-        return;
-    }
+    const targetWebhooks = webhooks.get(message.channel.id);
+    if (!targetWebhooks || targetWebhooks.length === 0) return;
 
     try {
         // Prepare message content
@@ -125,19 +317,24 @@ client.on('messageCreate', async (message) => {
         // Handle embeds (if any)
         const embeds = message.embeds.filter(embed => embed.type === 'rich');
 
-        // Send the mirrored message via webhook
-        await webhook.send({
+        // Prepare the message payload
+        const payload = {
             content: content || undefined,
-            username: `${message.author.displayName} (from ${message.guild.name})`,
+            username: `${message.author.displayName} (${message.guild.name})`,
             avatarURL: message.author.displayAvatarURL({ dynamic: true }),
             files: files.length > 0 ? files : undefined,
             embeds: embeds.length > 0 ? embeds : undefined,
-            allowedMentions: { parse: [] } // Prevent pinging users in mirrored messages
-        });
+            allowedMentions: { parse: [] }
+        };
 
-        console.log(`📨 Mirrored message from ${message.author.tag} in ${message.guild.name}/#${message.channel.name}`);
+        // Send to all other channels
+        for (const webhook of targetWebhooks) {
+            await webhook.send(payload);
+        }
+
+        console.log(`📨 Synced message from ${message.author.tag} (${message.guild.name}) to ${targetWebhooks.length} server(s)`);
     } catch (error) {
-        console.error('❌ Error mirroring message:', error);
+        console.error('❌ Error syncing message:', error);
     }
 });
 
